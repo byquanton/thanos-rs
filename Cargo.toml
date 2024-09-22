@@ -1,0 +1,10 @@
+[package]
+name = "thanos-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.18"
+flate2 = "1.0.33"
+simdnbt = "0.6.1"
+rayon = "1.10.0"
