@@ -2,10 +2,11 @@ mod utils;
 
 use crate::utils::copy_except_region;
 use clap::{Arg, Command};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use flate2::read::GzDecoder;
 use flate2::read::ZlibDecoder;
+use rayon::prelude::*;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const SECTOR_SIZE: u64 = 4096;
 
@@ -21,13 +22,20 @@ fn main() {
             .default_value("0")
             .required(false)
             .short('i')
-            .help("Specify the maximum Inhabited Time threshold, measured in ticks, for deleting chunks")
-        );
+            .help("Specify the maximum Inhabited Time threshold, measured in ticks, for deleting chunks"))
+        .arg(Arg::new("threads")
+            .default_value("4")
+            .required(false)
+            .short('t')
+            .help("Specify the number of threads to use for processing"));
     let matches = cmd.get_matches();
 
     let input_dir = matches.get_one::<String>("input_dir").unwrap();
     let output_dir = matches.get_one::<String>("output_dir").unwrap_or(input_dir);
     let inhabited_time_threshold: i64 = matches.get_one::<String>("inhabited-time").unwrap().parse().unwrap();
+    let num_threads: usize = matches.get_one::<String>("threads").unwrap().parse().unwrap();
+
+    rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap();
 
     if !Path::new(input_dir).exists() {
         eprintln!("error: input directory does not exist.");
@@ -69,50 +77,51 @@ fn optimise_region_files(input_directory: &str, output_directory: &str, inhabite
 
     let equal_input_output = input_directory.canonicalize()? == output_directory.canonicalize()?;
 
-    let input_files = std::fs::read_dir(input_directory)?;
+    let input_files: Vec<_> = std::fs::read_dir(input_directory)?
+        .filter_map(Result::ok)
+        .collect();
 
-    for file_entry in input_files {
-        let file_entry = file_entry?;
+    input_files.par_iter().for_each(|file_entry| {
         let file_path = file_entry.path();
         let file_name = file_path.file_name().unwrap().to_str().unwrap();
 
         // Filename of a Region File: r.[region_x].[region_z].mca
         if !file_name.ends_with(".mca") {
-            continue;
+            return;
         }
 
         let parts: Vec<&str> = file_name.split('.').collect();
         if parts.len() != 4 {
-            continue;
+            return;
         }
 
         let region_x = parts[1].parse::<i32>().unwrap();
         let region_z = parts[2].parse::<i32>().unwrap();
 
-        let mut file = std::fs::File::open(file_path.clone())?;
-        let file_len = file.metadata()?.len();
+        let mut file = std::fs::File::open(file_path.clone()).unwrap();
+        let file_len = file.metadata().unwrap().len();
 
         // Skipping/Removing empty region files
         if file_len == 0 {
             if equal_input_output {
                 println!("Removing empty region file {}", file_name);
-                std::fs::remove_file(file_entry.path())?;
-            }else {
+                std::fs::remove_file(file_entry.path()).unwrap();
+            } else {
                 println!("Skipping empty region file {}", file_name);
             }
-            continue;
+            return;
         }
 
         // Each region file begins with two 4KiB tables, the first containing the chunk locations and the second containing the last modified timestamps of the chunks.
         // If the file is smaller than the two tables, the headers are missing
         if file_len < 2 * SECTOR_SIZE {
             println!("Missing headers in region file!");
-            continue;
+            return;
         }
 
         let mut location_table = vec![0; SECTOR_SIZE as usize];
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut location_table)?;
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut location_table).unwrap();
 
         let mut chunk_data = Vec::new();
 
@@ -131,19 +140,19 @@ fn optimise_region_files(input_directory: &str, output_directory: &str, inhabite
 
                 // Seek to the position where the chunk header is located
                 // The size of the header is 5 bytes and followed by the stored chunk data
-                file.seek(SeekFrom::Start((sector_offset as u64) * SECTOR_SIZE))?;
+                file.seek(SeekFrom::Start((sector_offset as u64) * SECTOR_SIZE)).unwrap();
 
                 let mut chunk_size = [0; 4]; // Chunk data size is specified in the first 4 bytes
-                file.read_exact(&mut chunk_size)?;
+                file.read_exact(&mut chunk_size).unwrap();
                 let chunk_size = i32::from_be_bytes(chunk_size);
 
                 let mut compression_type = [0; 1]; // Compression type is specified in the last byte
-                file.read_exact(&mut compression_type)?;
+                file.read_exact(&mut compression_type).unwrap();
                 let compression_type = compression_type[0];
 
                 // Reads the chunk data with the calculated chunk size
                 let mut data = vec![0; chunk_size as usize - 1];
-                file.read_exact(&mut data)?;
+                file.read_exact(&mut data).unwrap();
 
                 // TODO: Unused, maybe useful for Debugging Outputs?
                 let _chunk_x = region_x * 32 + x as i32;
@@ -185,29 +194,28 @@ fn optimise_region_files(input_directory: &str, output_directory: &str, inhabite
         if chunk_data.is_empty() {
             // TODO: Make this message only shop up when debug output is active (implement logging?)
             // println!("Skipping region file {} as it has no chunks left after optimisation", file_name);
-            continue;
+            return;
         }
 
         // TODO: Clean up the following code and add comments
-        let mut output_file = std::fs::File::create(format!("{}/{}", output_directory.display(), file_name))?;
+        let mut output_file = std::fs::File::create(format!("{}/{}", output_directory.display(), file_name)).unwrap();
         let mut offset = 2 * SECTOR_SIZE;
         for (loc, compression_type, data) in chunk_data {
             let num_sectors = (data.len() as u64 + SECTOR_SIZE - 1) / SECTOR_SIZE;
             let new_loc = (offset / SECTOR_SIZE) << 8 | num_sectors;
-            output_file.seek(SeekFrom::Start((loc & 0xFF) as u64 * 4))?;
-            output_file.write_all(&new_loc.to_be_bytes())?;
+            output_file.seek(SeekFrom::Start((loc & 0xFF) as u64 * 4)).unwrap();
+            output_file.write_all(&new_loc.to_be_bytes()).unwrap();
 
-            output_file.seek(SeekFrom::Start(offset))?;
-            output_file.write_all(&(data.len() as i32 + 1).to_be_bytes())?;
-            output_file.write_all(&[compression_type])?;
-            output_file.write_all(&data)?;
+            output_file.seek(SeekFrom::Start(offset)).unwrap();
+            output_file.write_all(&(data.len() as i32 + 1).to_be_bytes()).unwrap();
+            output_file.write_all(&[compression_type]).unwrap();
+            output_file.write_all(&data).unwrap();
 
             offset += num_sectors * SECTOR_SIZE;
         }
 
-        output_file.set_len(offset)?;
-
-    }
+        output_file.set_len(offset).unwrap();
+    });
 
     Ok(())
 }
