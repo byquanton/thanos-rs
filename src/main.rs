@@ -1,274 +1,274 @@
-mod utils;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use crate::utils::copy_except_region;
-use clap::{Arg, Command};
-use flate2::read::GzDecoder;
-use flate2::read::ZlibDecoder;
-use rayon::prelude::*;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+mod engine;
 
-const SECTOR_SIZE: u64 = 4096;
+use eframe::egui;
+use engine::Progress;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-fn main() {
-    let cmd = Command::new("thanos-rs")
-        .arg(Arg::new("input_dir")
-            .required(true)
-            .help("Path to the world directory"))
-        .arg(Arg::new("output_dir")
-            .required(false)
-            .help("Path to the output directory"))
-        .arg(Arg::new("inhabited-time")
-            .default_value("0")
-            .required(false)
-            .short('i')
-            .help("Specify the maximum Inhabited Time threshold, measured in ticks, for deleting chunks"))
-        .arg(Arg::new("threads")
-            .default_value("4")
-            .required(false)
-            .short('t')
-            .help("Specify the number of threads to use for processing"));
-    let matches = cmd.get_matches();
-
-    let input_dir = matches.get_one::<String>("input_dir").unwrap();
-    let output_dir = matches.get_one::<String>("output_dir").unwrap_or(input_dir);
-    let inhabited_time_threshold: i64 = matches.get_one::<String>("inhabited-time").unwrap().parse().unwrap();
-    let num_threads: usize = matches.get_one::<String>("threads").unwrap().parse().unwrap();
-
-    rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global().unwrap();
-
-    if !Path::new(input_dir).exists() {
-        eprintln!("error: input directory does not exist.");
-        std::process::exit(1);
-    }
-
-    if input_dir != output_dir {
-        if Path::new(output_dir).exists() {
-            eprintln!("error: output directory already exists.");
-            std::process::exit(1);
-        }
-
-        std::fs::create_dir(output_dir).unwrap_or_else(|err| {
-            eprintln!("error: couldn't create output directory - {}", err);
-            std::process::exit(1);
-        });
-
-        println!("Copying world files from '{}' to '{}'.", input_dir, output_dir);
-        copy_except_region(input_dir, output_dir).unwrap_or_else(|err| {
-            eprintln!("error: failed to copy files - {}", err);
-            std::process::exit(1);
-        });
-        println!("Copied world files");
-
-        std::fs::create_dir(format!("{}/region", output_dir)).unwrap_or_else(|err| {
-            eprintln!("error: couldn't create region directory - {}", err);
-            std::process::exit(1);
-        });
-    }
-
-    // TODO: Detect other Dimensions
-    optimise_region_files(format!("{input_dir}/region").as_str(), format!("{output_dir}/region").as_str(), inhabited_time_threshold).expect("TODO: panic message");
+struct App {
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    output_custom: bool,
+    threshold_text: String,
+    threads: usize,
+    progress: Option<Arc<Progress>>,
 }
 
-
-fn optimise_region_files(input_directory: &str, output_directory: &str, inhabited_time_threshold: i64) -> std::io::Result<()> {
-    let input_directory = Path::new(input_directory);
-    let output_directory = Path::new(output_directory);
-
-    let equal_input_output = input_directory.canonicalize()? == output_directory.canonicalize()?;
-
-    let input_files: Vec<_> = std::fs::read_dir(input_directory)?
-        .filter_map(Result::ok)
-        .collect();
-
-    input_files.par_iter().for_each(|file_entry| {
-        let file_path = file_entry.path();
-        let file_name = file_path.file_name().unwrap().to_str().unwrap();
-
-        // Filename of a Region File: r.[region_x].[region_z].mca
-        if !file_name.ends_with(".mca") {
-            return;
+impl Default for App {
+    fn default() -> Self {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(16);
+        App {
+            input: None,
+            output: None,
+            output_custom: false,
+            threshold_text: "0".into(),
+            threads,
+            progress: None,
         }
+    }
+}
 
-        let parts: Vec<&str> = file_name.split('.').collect();
-        if parts.len() != 4 {
-            return;
+impl App {
+    fn set_input(&mut self, path: PathBuf) {
+        if !self.output_custom {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("world");
+            let out = path
+                .parent()
+                .map(|p| p.join(format!("{name}_thanos")))
+                .unwrap_or_else(|| PathBuf::from(format!("{name}_thanos")));
+            self.output = Some(out);
         }
+        self.input = Some(path);
+    }
 
-        let region_x = parts[1].parse::<i32>().unwrap();
-        let region_z = parts[2].parse::<i32>().unwrap();
+    fn running(&self) -> bool {
+        self.progress
+            .as_ref()
+            .map(|p| !p.finished.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+}
 
-        let mut file = std::fs::File::open(file_path.clone()).unwrap();
-        let file_len = file.metadata().unwrap().len();
+fn fmt_bytes(b: u64) -> String {
+    let b = b as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2} GB", b / 1024.0 / 1024.0 / 1024.0)
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / 1024.0 / 1024.0)
+    } else {
+        format!("{:.0} KB", b / 1024.0)
+    }
+}
 
-        // Skipping/Removing empty region files
-        if file_len == 0 {
-            if equal_input_output {
-                println!("Removing empty region file {}", file_name);
-                std::fs::remove_file(file_entry.path()).unwrap();
-            } else {
-                println!("Skipping empty region file {}", file_name);
-            }
-            return;
-        }
-
-        // Each region file begins with two 4KiB tables, the first containing the chunk locations and the second containing the last modified timestamps of the chunks.
-        // If the file is smaller than the two tables, the headers are missing
-        if file_len < 2 * SECTOR_SIZE {
-            println!("Missing headers in region file!");
-            return;
-        }
-
-        let mut location_table = vec![0; SECTOR_SIZE as usize];
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_exact(&mut location_table).unwrap();
-
-        let mut chunk_data = Vec::new();
-
-        // A region is made up of chunks in a 32 by 32 area.
-        for x in 0..32 {
-            for z in 0..32 {
-                let index = (x & 31) + (z & 31) * 32; // Calculates the index of the Chunk in the location_table
-                let loc = i32::from_be_bytes([location_table[index * 4], location_table[index * 4 + 1], location_table[index * 4 + 2], location_table[index * 4 + 3]]);
-
-                let num_sectors = loc & 0xFF;
-                let sector_offset = loc >> 8;
-
-                if sector_offset == 0 && num_sectors == 0 {
-                    continue; // Skips not generated chunks
-                }
-
-                // Seek to the position where the chunk header is located
-                // The size of the header is 5 bytes and followed by the stored chunk data
-                file.seek(SeekFrom::Start((sector_offset as u64) * SECTOR_SIZE)).unwrap();
-
-                let mut chunk_size = [0; 4]; // Chunk data size is specified in the first 4 bytes
-                file.read_exact(&mut chunk_size).unwrap();
-                let chunk_size = i32::from_be_bytes(chunk_size);
-
-                let mut compression_type = [0; 1]; // Compression type is specified in the last byte
-                file.read_exact(&mut compression_type).unwrap();
-                let compression_type = compression_type[0];
-
-                // TODO: Unused, maybe useful for Debugging Outputs?
-                let _chunk_x = region_x * 32 + x as i32;
-                let _chunk_z = region_z * 32 + z as i32;
-
-                // MODIFIED (line 161-164): Accept GZip(1), Zlib(2) and Uncompressed(3, MC 1.21+)
-                if compression_type != 1 && compression_type != 2 && compression_type != 3 {
-                    eprintln!("Error: unknown chunk data compression method: {}!", compression_type);
-                    continue;
-                }
-
-                // MODIFIED (line 154): Guard against chunk_size <= 0 to prevent underflow panic.
-                // Per the MCA region-file format the 4-byte length field ALWAYS counts
-                // the trailing 1-byte compression-type byte, so the actual payload is
-                // (chunk_size - 1) bytes for every supported compression type (1, 2, 3).
-                if chunk_size <= 0 {
-                    eprintln!("Error: invalid chunk size {} for chunk ({}, {}) in {}", chunk_size, _chunk_x, _chunk_z, file_name);
-                    continue;
-                }
-                let payload_len = (chunk_size as usize) - 1;
-
-                // Reads the chunk data with the calculated payload length
-                let mut data = vec![0; payload_len];
-                if let Err(err) = file.read_exact(&mut data) {
-                    eprintln!("Error reading chunk data for ({}, {}) in {}: {}", _chunk_x, _chunk_z, file_name, err);
-                    continue;
-                }
-
-                // MODIFIED (line 166-183): Add Uncompressed branch for MC 1.21+ type 3.
-                let mut decompressed_chunk_data: Vec<u8> = Vec::new();
-                match compression_type {
-                    1 => {
-                        let mut gz = GzDecoder::new(Cursor::new(data.clone()));
-                        if let Err(err) = gz.read_to_end(&mut decompressed_chunk_data) {
-                            eprintln!("Error decompressing (gzip) chunk at ({}, {}) in {}: {}", _chunk_x, _chunk_z, file_name, err);
-                            continue;
-                        }
-                    }
-                    2 => {
-                        let mut zlib = ZlibDecoder::new(Cursor::new(data.clone()));
-                        if let Err(err) = zlib.read_to_end(&mut decompressed_chunk_data) {
-                            eprintln!("Error decompressing (zlib) chunk at ({}, {}) in {}: {}", _chunk_x, _chunk_z, file_name, err);
-                            continue;
-                        }
-                    }
-                    3 => {
-                        // Uncompressed NBT – no decoding required.
-                        decompressed_chunk_data = data.clone();
-                    }
-                    _ => unreachable!(),
-                }
-
-                // MODIFIED (line 185-186): Robust multi-version InhabitedTime fallback.
-                //
-                // Chunk formats observed in the wild:
-                //   * Modern MC 1.18+: top-level compound tag "InhabitedTime" (Long)
-                //   * Legacy pre-1.18 / Anvil: "Level" -> "InhabitedTime"
-                //   * Some modded / older snapshots: lowercase "inhabitedTime"
-                //   * Newly-generated / empty chunks: missing entirely -> treat as 0
-                //
-                // A panic here would abort the whole rayon worker thread and lose
-                // every remaining chunk in this region file, so we degrade gracefully
-                // through a chain of fallbacks and default to 0 if nothing is found.
-                let inhabited_time = match simdnbt::borrow::read(&mut Cursor::new(&decompressed_chunk_data)) {
-                    Ok(nbt_opt) => match nbt_opt {
-                        Some(nbt) => match nbt.long("InhabitedTime") {
-                            Some(v) => v,
-                            None => match nbt.compound("Level") {
-                                Some(level) => match level.long("InhabitedTime") {
-                                    Some(v) => v,
-                                    None => match level.long("inhabitedTime") {
-                                        Some(v) => v,
-                                        None => 0,
-                                    },
-                                },
-                                None => match nbt.long("inhabitedTime") {
-                                    Some(v) => v,
-                                    None => 0,
-                                },
-                            },
-                        },
-                        None => 0,
-                    },
-                    Err(err) => {
-                        eprintln!("Error parsing NBT for chunk ({}, {}) in {}: {}", _chunk_x, _chunk_z, file_name, err);
-                        0
-                    }
-                };
-
-                if inhabited_time > inhabited_time_threshold {
-                    chunk_data.push((loc, compression_type, data));
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drag & Drop: Ordner ins Fenster ziehen
+        if !self.running() {
+            let dropped: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            if let Some(p) = dropped.into_iter().next() {
+                if p.is_dir() {
+                    self.set_input(p);
                 }
             }
         }
 
-        if chunk_data.is_empty() {
-            // TODO: Make this message only shop up when debug output is active (implement logging?)
-            // println!("Skipping region file {} as it has no chunks left after optimisation", file_name);
-            return;
+        if self.running() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // TODO: Clean up the following code and add comments
-        let mut output_file = std::fs::File::create(format!("{}/{}", output_directory.display(), file_name)).unwrap();
-        let mut offset = 2 * SECTOR_SIZE;
-        for (loc, compression_type, data) in chunk_data {
-            let num_sectors = (data.len() as u64 + SECTOR_SIZE - 1) / SECTOR_SIZE;
-            let new_loc = (offset / SECTOR_SIZE) << 8 | num_sectors;
-            output_file.seek(SeekFrom::Start((loc & 0xFF) as u64 * 4)).unwrap();
-            output_file.write_all(&new_loc.to_be_bytes()).unwrap();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Thanos-RS - Minecraft-Welt verkleinern");
+            ui.add_space(6.0);
+            ui.label("Entfernt Chunks, in denen kaum jemand war. Die Original-Welt bleibt unveraendert.");
+            ui.add_space(10.0);
 
-            output_file.seek(SeekFrom::Start(offset)).unwrap();
-            output_file.write_all(&(data.len() as i32 + 1).to_be_bytes()).unwrap();
-            output_file.write_all(&[compression_type]).unwrap();
-            output_file.write_all(&data).unwrap();
+            let running = self.running();
 
-            offset += num_sectors * SECTOR_SIZE;
-        }
+            ui.group(|ui| {
+                ui.label("1. Welt-Ordner (der Ordner mit level.dat)");
+                ui.label(
+                    self.input
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Noch nichts gewaehlt - Ordner hierher ziehen".into()),
+                );
+                ui.add_enabled_ui(!running, |ui| {
+                    if ui.button("Welt-Ordner waehlen ...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            self.set_input(p);
+                        }
+                    }
+                });
+            });
 
-        output_file.set_len(offset).unwrap();
-    });
+            ui.add_space(6.0);
+            ui.group(|ui| {
+                ui.label("2. Ausgabe-Ordner (muss neu sein)");
+                ui.label(
+                    self.output
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "-".into()),
+                );
+                ui.add_enabled_ui(!running, |ui| {
+                    if ui.button("Ausgabe-Ordner aendern ...").clicked() {
+                        if let Some(base) = rfd::FileDialog::new().pick_folder() {
+                            let name = self
+                                .input
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("world");
+                            self.output = Some(base.join(format!("{name}_thanos")));
+                            self.output_custom = true;
+                        }
+                    }
+                });
+            });
 
-    Ok(())
+            ui.add_space(6.0);
+            ui.group(|ui| {
+                ui.label("3. Einstellungen");
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Spielzeit-Grenze (Ticks, 20 Ticks = 1 Sekunde):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.threshold_text)
+                                .desired_width(90.0),
+                        );
+                    });
+                    ui.label("Chunks mit Spielzeit bis zu diesem Wert werden geloescht. 0 = nie besucht.");
+                    ui.horizontal(|ui| {
+                        ui.label("Threads:");
+                        ui.add(egui::Slider::new(&mut self.threads, 1..=32));
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+
+            let threshold: Option<i64> = self.threshold_text.trim().parse().ok();
+            let can_start = !running
+                && self.input.is_some()
+                && self.output.is_some()
+                && threshold.is_some()
+                && threshold.unwrap_or(-1) >= 0;
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_start, egui::Button::new("Start"))
+                    .clicked()
+                {
+                    let p = Arc::new(Progress::new());
+                    self.progress = Some(p.clone());
+                    let input = self.input.clone().unwrap();
+                    let output = self.output.clone().unwrap();
+                    let th = threshold.unwrap();
+                    let threads = self.threads;
+                    std::thread::spawn(move || {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            engine::run(input, output, th, threads, &p);
+                        }));
+                        if r.is_err() {
+                            if let Ok(mut e) = p.error.lock() {
+                                *e = Some("Interner Fehler (Panic).".into());
+                            }
+                            p.finished.store(true, Ordering::SeqCst);
+                        }
+                    });
+                }
+                if running && ui.button("Abbrechen").clicked() {
+                    if let Some(p) = &self.progress {
+                        p.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            });
+            if threshold.is_none() && !self.threshold_text.trim().is_empty() {
+                ui.colored_label(egui::Color32::RED, "Spielzeit muss eine ganze Zahl >= 0 sein.");
+            }
+
+            if let Some(p) = &self.progress {
+                ui.add_space(10.0);
+                let total = p.total_files.load(Ordering::Relaxed);
+                let done = p.done_files.load(Ordering::Relaxed);
+                let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .show_percentage()
+                        .text(format!("{done} / {total} Region-Dateien")),
+                );
+
+                let before = p.bytes_before.load(Ordering::Relaxed);
+                let after = p.bytes_after.load(Ordering::Relaxed);
+                ui.label(format!(
+                    "Chunks behalten: {}   entfernt: {}",
+                    p.chunks_kept.load(Ordering::Relaxed),
+                    p.chunks_removed.load(Ordering::Relaxed)
+                ));
+                ui.label(format!(
+                    "Region-Daten vorher: {}   nachher: {}",
+                    fmt_bytes(before),
+                    fmt_bytes(after)
+                ));
+
+                if p.finished.load(Ordering::SeqCst) {
+                    let err = p.error.lock().ok().and_then(|e| e.clone());
+                    match err {
+                        Some(e) => {
+                            ui.colored_label(egui::Color32::RED, format!("Fehler: {e}"));
+                        }
+                        None => {
+                            let saved = before.saturating_sub(after);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0, 160, 0),
+                                format!("Fertig! Gespart: {}", fmt_bytes(saved)),
+                            );
+                        }
+                    }
+                }
+
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if let Ok(l) = p.log.lock() {
+                            for line in l.iter() {
+                                ui.label(line);
+                            }
+                        }
+                    });
+            }
+        });
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([640.0, 640.0])
+            .with_min_inner_size([520.0, 480.0])
+            .with_drag_and_drop(true),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Thanos-RS",
+        options,
+        Box::new(|_cc| Ok(Box::new(App::default()))),
+    )
 }
