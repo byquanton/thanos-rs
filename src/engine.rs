@@ -232,6 +232,7 @@ fn process_region(src: &Path, dst: &Path, threshold: i64, p: &Progress) -> Resul
 
     if file_len < 2 * SECTOR_SIZE {
         p.log(format!("Uebersprungen (leer/zu klein): {name}"));
+        let _ = fs::remove_file(dst);
         return Ok(());
     }
 
@@ -273,9 +274,14 @@ fn process_region(src: &Path, dst: &Path, threshold: i64, p: &Progress) -> Resul
         // Externe Chunks (.mcc) bleiben unveraendert und werden nur gemeldet.
         if compression & 0x80 != 0 {
             p.log(format!("{name}: Chunk {index} ist extern (.mcc), bleibt erhalten"));
+            let mut ts = [0u8; 4];
+            let t0 = SECTOR_SIZE as usize + o;
+            ts.copy_from_slice(&header[t0..t0 + 4]);
+            kept.push(KeptChunk { index, timestamp: ts, compression, data: vec![] });
+            p.chunks_kept.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if !(1..=4).contains(&compression) || chunk_size <= 1 {
+        if !(1..=4).contains(&compression) && compression != 127 || chunk_size <= 1 {
             continue;
         }
         let payload_len = (chunk_size as usize) - 1;
@@ -319,6 +325,7 @@ fn process_region(src: &Path, dst: &Path, threshold: i64, p: &Progress) -> Resul
 
     if kept.is_empty() {
         p.log(format!("Region {name} ist nach der Bereinigung leer und wird weggelassen"));
+        let _ = fs::remove_file(dst);
         return Ok(());
     }
 
