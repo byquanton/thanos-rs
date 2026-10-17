@@ -1,4 +1,5 @@
 use flate2::read::{GzDecoder, ZlibDecoder};
+use lz4_flex::frame::FrameDecoder;
 use rayon::prelude::*;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -192,6 +193,13 @@ fn find_region_dirs(root: &Path) -> Vec<PathBuf> {
         result.push(direct);
     }
 
+    for dim in &["DIM-1", "DIM1"] {
+        let dim_dir = root.join(dim).join("region");
+        if dim_dir.is_dir() {
+            result.push(dim_dir);
+        }
+    }
+
     let dims = root.join("dimensions");
     if let Ok(ns_iter) = fs::read_dir(&dims) {
         for ns in ns_iter.flatten() {
@@ -267,7 +275,7 @@ fn process_region(src: &Path, dst: &Path, threshold: i64, p: &Progress) -> Resul
             p.log(format!("{name}: Chunk {index} ist extern (.mcc), bleibt erhalten"));
             continue;
         }
-        if !(1..=3).contains(&compression) || chunk_size <= 1 {
+        if !(1..=4).contains(&compression) || chunk_size <= 1 {
             continue;
         }
         let payload_len = (chunk_size as usize) - 1;
@@ -284,10 +292,12 @@ fn process_region(src: &Path, dst: &Path, threshold: i64, p: &Progress) -> Resul
         let ok = match compression {
             1 => GzDecoder::new(Cursor::new(&data)).read_to_end(&mut raw).is_ok(),
             2 => ZlibDecoder::new(Cursor::new(&data)).read_to_end(&mut raw).is_ok(),
-            _ => {
+            3 => {
                 raw = data.clone();
                 true
             }
+            4 => FrameDecoder::new(Cursor::new(&data)).read_to_end(&mut raw).is_ok(),
+            _ => false,
         };
 
         // Im Zweifel behalten.
@@ -475,4 +485,144 @@ pub fn zip_dir(dir: &Path, p: &Progress) -> Result<(), String> {
     zip.finish().map_err(|e| e.to_string())?;
     p.log(format!("ZIP fertig: {}", zip_path.display()));
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_read_inhabited_time() {
+        // Erstelle Dummy-NBT-Bytes für ein Compound mit { InhabitedTime: 123L }
+        let mut bytes = vec![];
+        bytes.push(10); // Compound
+        bytes.push(0); bytes.push(0); // Leerer Name
+
+        bytes.push(3); // Int
+        bytes.push(0); bytes.push(4); // Längenangabe Name
+        bytes.extend_from_slice(b"Test"); // Name
+        bytes.extend_from_slice(&1i32.to_be_bytes());
+
+        bytes.push(4); // Long
+        bytes.push(0); bytes.push(13); // Längenangabe Name
+        bytes.extend_from_slice(b"InhabitedTime"); // Name
+        bytes.extend_from_slice(&123i64.to_be_bytes()); // Wert
+
+        bytes.push(0); // End-Tag
+
+        assert_eq!(read_inhabited_time(&bytes), Some(123));
+
+        // Teste ohne InhabitedTime
+        let mut bytes2 = vec![];
+        bytes2.push(10);
+        bytes2.push(0); bytes2.push(0);
+        bytes2.push(3);
+        bytes2.push(0); bytes2.push(4);
+        bytes2.extend_from_slice(b"Test");
+        bytes2.extend_from_slice(&1i32.to_be_bytes());
+        bytes2.push(0);
+        assert_eq!(read_inhabited_time(&bytes2), None);
+    }
+
+    #[test]
+    fn test_find_region_dirs() {
+        let temp_dir = std::env::temp_dir().join("thanos_rs_test_region_dirs");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let p1 = temp_dir.join("region");
+        let p2 = temp_dir.join("DIM-1").join("region");
+        let p3 = temp_dir.join("DIM1").join("region");
+        let p4 = temp_dir.join("dimensions").join("minecraft").join("overworld").join("region");
+        let p5 = temp_dir.join("dimensions").join("custom").join("dim").join("region");
+
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+        fs::create_dir_all(&p3).unwrap();
+        fs::create_dir_all(&p4).unwrap();
+        fs::create_dir_all(&p5).unwrap();
+
+        let mut dirs = find_region_dirs(&temp_dir);
+        dirs.sort();
+
+        let mut expected = vec![p1, p2, p3, p4, p5];
+        expected.sort();
+
+        assert_eq!(dirs, expected);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_run_integration() {
+        let temp_dir = std::env::temp_dir().join("thanos_rs_integration_test");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let input_dir = temp_dir.join("world_in");
+        let output_dir = temp_dir.join("world_out");
+
+        fs::create_dir_all(&input_dir).unwrap();
+        // level.dat anlegen
+        fs::write(input_dir.join("level.dat"), b"dummy").unwrap();
+
+        let reg_dir = input_dir.join("region");
+        fs::create_dir_all(&reg_dir).unwrap();
+
+        // Erstelle eine gültige .mca Datei mit einem LZ4-komprimierten Chunk
+        let mca_path = reg_dir.join("r.0.0.mca");
+        let mut file = fs::File::create(&mca_path).unwrap();
+
+        // 8KB Header
+        let mut header = vec![0u8; 8192];
+        // Chunk 0 Position: Sektor 2, 1 Sektor Länge
+        header[0] = 0; header[1] = 0; header[2] = 2; header[3] = 1;
+        file.write_all(&header).unwrap();
+
+        // Chunk-Daten (LZ4)
+        // Erstelle zuerst die NBT-Daten
+        let mut nbt_bytes = vec![];
+        nbt_bytes.push(10); // Compound
+        nbt_bytes.push(0); nbt_bytes.push(0); // Leerer Name
+        nbt_bytes.push(4); // Long
+        nbt_bytes.push(0); nbt_bytes.push(13); // Längenangabe Name
+        nbt_bytes.extend_from_slice(b"InhabitedTime"); // Name
+        nbt_bytes.extend_from_slice(&200i64.to_be_bytes()); // Wert > 100 (Grenzwert)
+        nbt_bytes.push(0); // End-Tag
+
+        // Mit LZ4 komprimieren
+        let mut compressed = vec![];
+        let mut encoder = lz4_flex::frame::FrameEncoder::new(&mut compressed);
+        encoder.write_all(&nbt_bytes).unwrap();
+        encoder.finish().unwrap();
+
+        // Chunk-Header schreiben: Länge (4), Kompression (1)
+        let chunk_len = (compressed.len() + 1) as i32;
+        file.write_all(&chunk_len.to_be_bytes()).unwrap();
+        file.write_all(&[4]).unwrap(); // Kompression = 4 (LZ4)
+        file.write_all(&compressed).unwrap();
+
+        // Auf Sektorgröße auffüllen
+        let written = 4 + 1 + compressed.len();
+        let pad = 4096 - written;
+        file.write_all(&vec![0u8; pad]).unwrap();
+
+        let p = Progress::new();
+        let result = run(input_dir.clone(), output_dir.clone(), 100, 1, &p);
+
+        assert!(result.is_some());
+        let final_out = result.unwrap();
+        assert!(final_out.join("level.dat").exists());
+        let out_mca = final_out.join("region").join("r.0.0.mca");
+        assert!(out_mca.exists());
+
+        // Prüfe, ob der Chunk behalten wurde
+        let p2 = Progress::new();
+        // Da wir hier nicht alles entpacken, rufen wir process_region nochmal in ein Dummy-Verzeichnis auf,
+        // um zu sehen, ob chunks_kept hochzählt.
+        let dummy_out = final_out.join("region").join("dummy.mca");
+        process_region(&out_mca, &dummy_out, 100, &p2).unwrap();
+        assert_eq!(p2.chunks_kept.load(Ordering::Relaxed), 1);
+        assert_eq!(p2.chunks_removed.load(Ordering::Relaxed), 0);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

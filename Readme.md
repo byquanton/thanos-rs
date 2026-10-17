@@ -68,6 +68,7 @@ Wer Fehler findet oder Verbesserungsvorschläge hat, kann gerne ein Issue eröff
 | 26.1 | ✅ |
 | 26.2 | ✅ (sollte funktionieren, da gleiches Speicherformat) |
 | 26.3 | ✅ (sollte funktionieren, da gleiches Speicherformat) |
+| 26.1.2 | ✅ |
 
 Das Tool arbeitet direkt auf den Region-Dateien (.mca) der Welt, unabhängig von der genauen Minecraft-Version. Solange sich das Speicherformat nicht ändert, sollte es auch mit zukünftigen Versionen ab 26.1 funktionieren. Getestet wurde konkret mit Version 26.1.
 

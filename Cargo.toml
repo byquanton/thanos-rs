@@ -8,6 +8,7 @@ eframe = "0.29"
 rfd = "0.15"
 rayon = "1"
 flate2 = "1"
+lz4_flex = "0.11"
 zip = "2"
 
 [profile.release]
