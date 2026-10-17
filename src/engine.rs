@@ -8,7 +8,6 @@ use std::sync::Mutex;
 
 const SECTOR_SIZE: u64 = 4096;
 
-/// Gemeinsamer Zustand zwischen Worker-Thread und GUI.
 pub struct Progress {
     pub total_files: AtomicUsize,
     pub done_files: AtomicUsize,
@@ -50,9 +49,7 @@ impl Progress {
 }
 
 // ---------------------------------------------------------------
-// Minimaler NBT-Leser: sucht einen Long-Tag "InhabitedTime".
-// Gibt None zurueck, wenn nichts gefunden wurde oder die Daten
-// kaputt sind (nie Panic).
+// Minimaler NBT-Leser: sucht "InhabitedTime" (Long).
 // ---------------------------------------------------------------
 struct Reader<'a> {
     d: &'a [u8],
@@ -82,9 +79,7 @@ impl<'a> Reader<'a> {
     }
     fn i64(&mut self) -> Option<i64> {
         let b = self.take(8)?;
-        Some(i64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        Some(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
     fn name(&mut self) -> Option<&'a [u8]> {
         let n = self.u16()? as usize;
@@ -92,29 +87,19 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Ueberspringt den Inhalt eines Tags (ohne Typ-Byte und Namen).
+/// Ueberspringt den Payload eines NBT-Tags.
 fn skip_payload(r: &mut Reader, tag: u8, depth: u32) -> Option<()> {
     if depth > 512 {
         return None;
     }
     match tag {
-        1 => {
-            r.take(1)?;
-        }
-        2 => {
-            r.take(2)?;
-        }
-        3 | 5 => {
-            r.take(4)?;
-        }
-        4 | 6 => {
-            r.take(8)?;
-        }
+        1 => { r.take(1)?; }
+        2 => { r.take(2)?; }
+        3 | 5 => { r.take(4)?; }
+        4 | 6 => { r.take(8)?; }
         7 => {
             let n = r.i32()?;
-            if n < 0 {
-                return None;
-            }
+            if n < 0 { return None; }
             r.take(n as usize)?;
         }
         8 => {
@@ -124,33 +109,25 @@ fn skip_payload(r: &mut Reader, tag: u8, depth: u32) -> Option<()> {
         9 => {
             let t = r.u8()?;
             let n = r.i32()?;
-            if n < 0 {
-                return None;
-            }
+            if n < 0 { return None; }
             for _ in 0..n {
                 skip_payload(r, t, depth + 1)?;
             }
         }
         10 => loop {
             let t = r.u8()?;
-            if t == 0 {
-                break;
-            }
+            if t == 0 { break; }
             r.name()?;
             skip_payload(r, t, depth + 1)?;
         },
         11 => {
             let n = r.i32()?;
-            if n < 0 {
-                return None;
-            }
+            if n < 0 { return None; }
             r.take((n as usize).checked_mul(4)?)?;
         }
         12 => {
             let n = r.i32()?;
-            if n < 0 {
-                return None;
-            }
+            if n < 0 { return None; }
             r.take((n as usize).checked_mul(8)?)?;
         }
         _ => return None,
@@ -158,42 +135,30 @@ fn skip_payload(r: &mut Reader, tag: u8, depth: u32) -> Option<()> {
     Some(())
 }
 
-/// Liest ein Compound. Sucht "InhabitedTime" direkt darin, sonst
-/// (eine Ebene tiefer) in "Level".
-fn find_in_compound(r: &mut Reader, allow_level: bool, depth: u32) -> Option<i64> {
-    let mut found: Option<i64> = None;
-    loop {
-        let t = r.u8()?;
-        if t == 0 {
-            return found;
-        }
-        let name = r.name()?;
-        if t == 4 && (name == b"InhabitedTime" || name == b"inhabitedTime") {
-            found = Some(r.i64()?);
-        } else if t == 10 && allow_level && name == b"Level" {
-            let inner = find_in_compound(r, false, depth + 1)?;
-            if found.is_none() {
-                found = Some(inner);
-            }
-        } else {
-            skip_payload(r, t, depth + 1)?;
-        }
-    }
-}
-
-pub fn read_inhabited_time(nbt: &[u8]) -> Option<i64> {
-    let mut r = Reader { d: nbt, p: 0 };
+/// Liest InhabitedTime aus dem NBT-Root eines Chunks.
+fn read_inhabited_time(raw: &[u8]) -> Option<i64> {
+    let mut r = Reader { d: raw, p: 0 };
     if r.u8()? != 10 {
         return None;
     }
-    r.name()?; // Name des Wurzel-Tags (meist leer)
-    find_in_compound(&mut r, true, 0)
+    r.name()?;
+    loop {
+        let t = r.u8()?;
+        if t == 0 {
+            return None;
+        }
+        let name = r.name()?;
+        if t == 4 && name == b"InhabitedTime" {
+            return r.i64();
+        }
+        skip_payload(&mut r, t, 1)?;
+    }
 }
 
 // ---------------------------------------------------------------
-// Dateien kopieren (alles ausser Region-Ordner)
+// Dateien kopieren (komplette Welt, Region wird danach ersetzt)
 // ---------------------------------------------------------------
-fn copy_except_region(input: &Path, output: &Path, p: &Progress) -> std::io::Result<()> {
+fn copy_all(input: &Path, output: &Path, p: &Progress) -> std::io::Result<()> {
     let mut stack = vec![input.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -204,10 +169,6 @@ fn copy_except_region(input: &Path, output: &Path, p: &Progress) -> std::io::Res
             let rel = path.strip_prefix(input).unwrap();
             let dest = output.join(rel);
             if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name == "region" {
-                    continue; // wird separat verarbeitet
-                }
                 fs::create_dir_all(&dest)?;
                 stack.push(path);
             } else {
@@ -221,19 +182,24 @@ fn copy_except_region(input: &Path, output: &Path, p: &Progress) -> std::io::Res
     Ok(())
 }
 
-/// Alle Ordner mit Region-Dateien finden (Overworld, DIM-1, DIM1, ...)
+/// Region-Ordner finden: "region" im Welt-Root und
+/// "dimensions/<namespace>/<name>/region" (Vanilla-Layout).
 fn find_region_dirs(root: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if let Ok(rd) = fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let path = e.path();
-                if path.is_dir() {
-                    if path.file_name().and_then(|n| n.to_str()) == Some("region") {
-                        result.push(path);
-                    } else {
-                        stack.push(path);
+
+    let direct = root.join("region");
+    if direct.is_dir() {
+        result.push(direct);
+    }
+
+    let dims = root.join("dimensions");
+    if let Ok(ns_iter) = fs::read_dir(&dims) {
+        for ns in ns_iter.flatten() {
+            if let Ok(dim_iter) = fs::read_dir(ns.path()) {
+                for dim in dim_iter.flatten() {
+                    let r = dim.path().join("region");
+                    if r.is_dir() {
+                        result.push(r);
                     }
                 }
             }
@@ -243,19 +209,14 @@ fn find_region_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 struct KeptChunk {
-    index: usize, // Position 0..1023 in der Tabelle
+    index: usize,
     timestamp: [u8; 4],
     compression: u8,
     data: Vec<u8>,
 }
 
 /// Verarbeitet eine einzelne .mca-Datei.
-fn process_region(
-    src: &Path,
-    dst: &Path,
-    threshold: i64,
-    p: &Progress,
-) -> Result<(), String> {
+fn process_region(src: &Path, dst: &Path, threshold: i64, p: &Progress) -> Result<(), String> {
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
     let mut file = fs::File::open(src).map_err(|e| format!("{name}: {e}"))?;
     let file_len = file.metadata().map_err(|e| format!("{name}: {e}"))?.len();
@@ -280,7 +241,7 @@ fn process_region(
         let sector_offset = (loc >> 8) as u64;
         let num_sectors = (loc & 0xFF) as u64;
         if sector_offset == 0 || num_sectors == 0 {
-            continue; // nicht generiert
+            continue;
         }
         let pos = sector_offset * SECTOR_SIZE;
         if pos + 5 > file_len {
@@ -301,17 +262,12 @@ fn process_region(
         }
         let compression = comp[0];
 
-        // Externe Chunks (Bit 128 gesetzt) liegen in .mcc-Dateien: sicherheitshalber behalten wir sie nicht,
-        // da wir sie nicht mitkopieren. Wir melden es nur.
+        // Externe Chunks (.mcc) bleiben unveraendert und werden nur gemeldet.
         if compression & 0x80 != 0 {
-            p.log(format!("{name}: Chunk {index} ist extern (.mcc), uebersprungen"));
+            p.log(format!("{name}: Chunk {index} ist extern (.mcc), bleibt erhalten"));
             continue;
         }
-        if !(1..=3).contains(&compression) {
-            p.log(format!("{name}: Chunk {index} unbekannte Kompression {compression}"));
-            continue;
-        }
-        if chunk_size <= 1 {
+        if !(1..=3).contains(&compression) || chunk_size <= 1 {
             continue;
         }
         let payload_len = (chunk_size as usize) - 1;
@@ -334,22 +290,17 @@ fn process_region(
             }
         };
 
-        // Bei Lesefehler behalten wir den Chunk lieber (sicherer als loeschen).
-        let inhabited = if ok { read_inhabited_time(&raw) } else { None };
-        let keep = match inhabited {
+        // Im Zweifel behalten.
+        let keep = match if ok { read_inhabited_time(&raw) } else { None } {
             Some(t) => t > threshold,
             None => true,
         };
 
         if keep {
             let mut ts = [0u8; 4];
-            ts.copy_from_slice(&header[(SECTOR_SIZE as usize + o)..(SECTOR_SIZE as usize + o + 4)]);
-            kept.push(KeptChunk {
-                index,
-                timestamp: ts,
-                compression,
-                data,
-            });
+            let t0 = SECTOR_SIZE as usize + o;
+            ts.copy_from_slice(&header[t0..t0 + 4]);
+            kept.push(KeptChunk { index, timestamp: ts, compression, data });
             p.chunks_kept.fetch_add(1, Ordering::Relaxed);
         } else {
             p.chunks_removed.fetch_add(1, Ordering::Relaxed);
@@ -374,8 +325,8 @@ fn process_region(
         let loc: u32 = ((next_sector as u32) << 8) | sectors as u32;
         let o = c.index * 4;
         out_header[o..o + 4].copy_from_slice(&loc.to_be_bytes());
-        out_header[SECTOR_SIZE as usize + o..SECTOR_SIZE as usize + o + 4]
-            .copy_from_slice(&c.timestamp);
+        let t0 = SECTOR_SIZE as usize + o;
+        out_header[t0..t0 + 4].copy_from_slice(&c.timestamp);
 
         body.extend_from_slice(&(c.data.len() as i32 + 1).to_be_bytes());
         body.push(c.compression);
@@ -390,53 +341,48 @@ fn process_region(
     out.write_all(&body).map_err(|e| format!("{name}: {e}"))?;
     out.flush().map_err(|e| format!("{name}: {e}"))?;
 
-    let out_len = 2 * SECTOR_SIZE + body.len() as u64;
-    p.bytes_after.fetch_add(out_len, Ordering::Relaxed);
+    p.bytes_after.fetch_add(2 * SECTOR_SIZE + body.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 
-/// Hauptfunktion: laeuft im Worker-Thread.
-pub fn run(input: PathBuf, output: PathBuf, threshold: i64, threads: usize, p: &Progress) {
-    let result = run_inner(&input, &output, threshold, threads, p);
-    if let Err(e) = result {
-        if let Ok(mut err) = p.error.lock() {
-            *err = Some(e);
+/// Gibt den tatsaechlich verwendeten Ausgabe-Pfad zurueck (None = Fehler).
+pub fn run(input: PathBuf, output: PathBuf, threshold: i64, threads: usize, p: &Progress) -> Option<PathBuf> {
+    let result = match run_inner(&input, &output, threshold, threads, p) {
+        Ok(final_out) => Some(final_out),
+        Err(e) => {
+            if let Ok(mut err) = p.error.lock() {
+                *err = Some(e);
+            }
+            None
         }
-    }
+    };
     p.finished.store(true, Ordering::SeqCst);
+    result
 }
 
-fn run_inner(
-    input: &Path,
-    output: &Path,
-    threshold: i64,
-    threads: usize,
-    p: &Progress,
-) -> Result<(), String> {
+fn run_inner(input: &Path, output: &Path, threshold: i64, threads: usize, p: &Progress) -> Result<PathBuf, String> {
     if !input.is_dir() {
         return Err("Der Eingabe-Ordner existiert nicht.".into());
     }
     if !input.join("level.dat").exists() {
         return Err("In diesem Ordner liegt keine level.dat. Das ist keine Minecraft-Welt.".into());
     }
-    let same = match (input.canonicalize(), output.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if same {
-        return Err("Eingabe und Ausgabe duerfen nicht derselbe Ordner sein.".into());
+
+    // Freien Ausgabe-Namen waehlen: Name, Name_2, Name_3 ...
+    let base = output.to_path_buf();
+    let mut output_path = base.clone();
+    let mut n = 2;
+    while output_path.exists() {
+        let name = base.file_name().unwrap_or_default().to_string_lossy().to_string();
+        output_path = base.with_file_name(format!("{name}_{n}"));
+        n += 1;
     }
-    if output.exists() {
-        return Err("Der Ausgabe-Ordner existiert schon. Bitte einen neuen Namen waehlen.".into());
-    }
-    if let Ok(out_abs) = output.canonicalize().or_else(|_| {
-        output
-            .parent()
-            .map(|pp| pp.canonicalize().map(|c| c.join(output.file_name().unwrap_or_default())))
-            .unwrap_or_else(|| Ok(output.to_path_buf()))
-    }) {
-        if let Ok(in_abs) = input.canonicalize() {
-            if out_abs.starts_with(&in_abs) {
+    let output = output_path.as_path();
+    p.log(format!("Ausgabe: {}", output.display()));
+
+    if let (Ok(a), Some(parent)) = (input.canonicalize(), output.parent()) {
+        if let Ok(pa) = parent.canonicalize() {
+            if pa.starts_with(&a) {
                 return Err("Der Ausgabe-Ordner darf nicht innerhalb der Welt liegen.".into());
             }
         }
@@ -445,19 +391,17 @@ fn run_inner(
     fs::create_dir_all(output).map_err(|e| format!("Ausgabe-Ordner nicht erstellbar: {e}"))?;
 
     p.log("Kopiere Weltdateien ...");
-    copy_except_region(input, output, p).map_err(|e| format!("Kopieren fehlgeschlagen: {e}"))?;
+    copy_all(input, output, p).map_err(|e| format!("Kopieren fehlgeschlagen: {e}"))?;
     if p.cancel.load(Ordering::Relaxed) {
         return Err("Abgebrochen.".into());
     }
 
-    // Alle Region-Ordner sammeln und Dateiliste bauen
-    let region_dirs = find_region_dirs(input);
     let mut jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for rd in &region_dirs {
+    for rd in find_region_dirs(input) {
         let rel = rd.strip_prefix(input).unwrap();
         let out_dir = output.join(rel);
         fs::create_dir_all(&out_dir).map_err(|e| format!("Region-Ordner nicht erstellbar: {e}"))?;
-        if let Ok(entries) = fs::read_dir(rd) {
+        if let Ok(entries) = fs::read_dir(&rd) {
             for e in entries.flatten() {
                 let path = e.path();
                 if path.extension().and_then(|x| x.to_str()) == Some("mca") {
@@ -495,12 +439,40 @@ fn run_inner(
     }
     let errs = errors.into_inner().unwrap_or_default();
     if !errs.is_empty() {
-        return Err(format!(
-            "{} Datei(en) mit Fehlern. Erster Fehler: {}",
-            errs.len(),
-            errs[0]
-        ));
+        return Err(format!("{} Datei(en) mit Fehlern. Erster: {}", errs.len(), errs[0]));
     }
     p.log("Fertig.");
+    Ok(output.to_path_buf())
+}
+
+pub fn zip_dir(dir: &Path, p: &Progress) -> Result<(), String> {
+    use zip::write::SimpleFileOptions;
+
+    p.log("Packe ZIP ...");
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("world");
+    let zip_path = dir.with_file_name(format!("{name}.zip"));
+    let file = fs::File::create(&zip_path).map_err(|e| format!("ZIP: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let base = dir.parent().unwrap_or(dir);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            let rel = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+            if path.is_dir() {
+                zip.add_directory(format!("{rel}/"), opts).map_err(|e| e.to_string())?;
+                stack.push(path);
+            } else {
+                zip.start_file(rel, opts).map_err(|e| e.to_string())?;
+                let data = fs::read(&path).map_err(|e| e.to_string())?;
+                zip.write_all(&data).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    p.log(format!("ZIP fertig: {}", zip_path.display()));
     Ok(())
 }
